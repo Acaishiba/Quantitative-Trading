@@ -1,4 +1,3 @@
-# backtest.py 文件开头
 import ccxt
 import pandas as pd
 import numpy as np
