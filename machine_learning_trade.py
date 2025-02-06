@@ -4,6 +4,7 @@ import pandas as pd
 from sklearn.cluster import KMeans
 from time import sleep
 from datetime import datetime
+import math
 
 # ========== 交易所配置 ==========
 exchange = ccxt.binance({
@@ -12,9 +13,11 @@ exchange = ccxt.binance({
     'enableRateLimit': True,
     'options': {'defaultType': 'spot'}
 })
+#exchange.set_sandbox_mode(True)  # enable sandbox mode
+exchange.load_markets()
 
 # ========== 策略参数 ==========
-SYMBOL = 'BTC/USDT'
+SYMBOL = 'SUI/USDT'
 TIMEFRAME = '1h'
 
 # 核心参数
@@ -108,10 +111,30 @@ class EnhancedSuperTrend(AdaptiveSuperTrend):
         ])
 
     def calculate_position_size(self, atr):
-        """基于风险的动态仓位计算"""
+        # 获取账户和交易对信息
         balance = exchange.fetch_balance()['USDT']['free']
+        market = exchange.market(SYMBOL)
+        min_amount = market['limits']['amount']['min']
+        precision = market['precision']['amount']
+        decimals = abs(int(round(math.log10(precision))))
+        
+        # 计算理论仓位
         risk_amount = balance * RISK_PARAMS['position_risk_pct']
-        return risk_amount / (atr * RISK_PARAMS['stop_loss_pct'])
+        position_size = risk_amount / (atr * RISK_PARAMS['stop_loss_pct'])
+        
+        # 获取当前价格
+        ticker = exchange.fetch_ticker(SYMBOL)
+        current_price = ticker['last']
+        
+        # 实际可买数量限制
+        max_affordable = (balance * 0.99) / current_price  # 保留1%作为手续费
+        position_size = min(position_size, max_affordable)
+        
+        # 遵守交易所规则
+        position_size = max(min_amount, position_size)  # 不低于最小交易量
+        position_size = round(position_size, decimals) # 精度处理
+        
+        return position_size
 
     def update_drawdown(self):
         """实时回撤监控"""
@@ -139,6 +162,7 @@ class EnhancedSuperTrend(AdaptiveSuperTrend):
         """执行交易操作"""
         try:
             current_price = exchange.fetch_ticker(SYMBOL)['last']
+            print(side)
             
             if side == 'buy':
                 atr = self.data['ATR'].iloc[-1]
