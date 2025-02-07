@@ -117,7 +117,7 @@ class AdaptiveSuperTrend:
             
             # 方向判断逻辑
             if np.isnan(supertrend[i-1]):
-                directions[i] = 1
+                directions[i] = -1
             elif supertrend[i-1] == prev_upper:
                 directions[i] = 1 if df['close'].iloc[i] > current_upper else -1
             else:
