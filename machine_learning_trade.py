@@ -62,37 +62,71 @@ class AdaptiveSuperTrend:
         return tr.rolling(period).mean()
 
     def train_clusters(self, atr_series):
-        """训练波动率聚类模型"""
-        self.kmeans.fit(atr_series.values.reshape(-1, 1))
+        """改进的聚类初始化方法"""
+        # Pine Script使用分位数初始化
+        high_vol = np.quantile(atr_series, 0.75)
+        mid_vol = np.quantile(atr_series, 0.5)
+        low_vol = np.quantile(atr_series, 0.25)
         
+        # 使用K-Means++初始化
+        self.kmeans = KMeans(n_clusters=3, init=np.array([
+            [low_vol], 
+            [mid_vol], 
+            [high_vol]
+        ]), n_init=1)
+        
+        self.kmeans.fit(atr_series.values.reshape(-1, 1))      
     def get_cluster_centers(self):
         """获取排序后的聚类中心"""
         return sorted(self.kmeans.cluster_centers_.flatten())
 
     def supertrend(self, df, atr_value, factor):
-        """生成SuperTrend信号"""
+        """精确复刻Pine Script逻辑的SuperTrend"""
         hl2 = (df['high'] + df['low']) / 2
         upper = hl2 + factor * atr_value
         lower = hl2 - factor * atr_value
         
-        st = [np.nan] * len(df)
-        direction = [1] * len(df)  # 1=多头，-1=空头
+        # 初始化轨道数组
+        upper_bands = [np.nan] * len(df)
+        lower_bands = [np.nan] * len(df)
+        directions = [1] * len(df)  # 1=多头，-1=空头
+        supertrend = [np.nan] * len(df)
         
         for i in range(1, len(df)):
+            # 继承前值
+            prev_upper = upper_bands[i-1]
+            prev_lower = lower_bands[i-1]
             prev_close = df['close'].iloc[i-1]
             
-            # 更新趋势方向
-            if df['close'].iloc[i] > upper.iloc[i-1]:
-                direction[i] = 1
-            elif df['close'].iloc[i] < lower.iloc[i-1]:
-                direction[i] = -1
+            # 动态调整上下轨
+            # 下轨逻辑
+            if lower.iloc[i] > prev_lower or prev_close < prev_lower:
+                current_lower = lower.iloc[i]
             else:
-                direction[i] = direction[i-1]
+                current_lower = prev_lower
                 
-            # 更新SuperTrend值
-            st[i] = lower.iloc[i] if direction[i] == 1 else upper.iloc[i]
+            # 上轨逻辑    
+            if upper.iloc[i] < prev_upper or prev_close > prev_upper:
+                current_upper = upper.iloc[i]
+            else:
+                current_upper = prev_upper
+                
+            # 更新轨道值
+            upper_bands[i] = current_upper
+            lower_bands[i] = current_lower
             
-        return st[-1], direction[-1]
+            # 方向判断逻辑
+            if np.isnan(supertrend[i-1]):
+                directions[i] = 1
+            elif supertrend[i-1] == prev_upper:
+                directions[i] = 1 if df['close'].iloc[i] > current_upper else -1
+            else:
+                directions[i] = -1 if df['close'].iloc[i] < current_lower else 1
+                
+            # 确定当前SuperTrend值
+            supertrend[i] = current_lower if directions[i] == 1 else current_upper
+        
+        return supertrend[-1], directions[-1]
 
 # ========== 增强策略子类 ==========
 class EnhancedSuperTrend(AdaptiveSuperTrend):
@@ -211,39 +245,77 @@ class EnhancedSuperTrend(AdaptiveSuperTrend):
         new_trade.to_csv('trading_log.csv', mode='a', header=False, index=False)
 
     def analyze_performance(self):
-        """策略绩效分析"""
+        """增强版绩效分析"""
         try:
-            trades = pd.read_csv('trading_log.csv')
-            if len(trades) < 2:
+            import os
+            if not os.path.exists('trading_log.csv'):
+                print("⚠️ 无交易日志文件")
                 return
 
-            # 计算胜率
-            winning = trades[trades['type'] == 'sell']['balance'] > trades['balance'].shift(1)
-            win_rate = winning.mean()
+            # 强制类型转换 + 处理空值
+            trades = pd.read_csv('trading_log.csv', 
+                dtype={
+                    'type': 'category',
+                    'price': float,
+                    'quantity': float,
+                    'balance': float
+                },
+                parse_dates=['timestamp']
+            ).dropna(subset=['type', 'balance'])
+
+            if len(trades) < 2:
+                print("⏳ 交易数据不足")
+                return
+
+            # 计算胜率（仅比较完整交易对）
+            buy_mask = trades['type'] == 'buy'
+            sell_mask = trades['type'] == 'sell'
             
-            # 计算夏普比率
+            # 确保买卖交替出现
+            valid_pairs = []
+            buy_index = -1
+            for i, row in trades.iterrows():
+                if row['type'] == 'buy':
+                    buy_index = i
+                elif row['type'] == 'sell' and buy_index != -1:
+                    valid_pairs.append( (buy_index, i) )
+                    buy_index = -1
+
+            # 统计盈利交易
+            winning = 0
+            for buy, sell in valid_pairs:
+                if trades.iloc[sell]['balance'] > trades.iloc[buy]['balance']:
+                    winning += 1
+            win_rate = winning / len(valid_pairs) if len(valid_pairs) >0 else 0
+
+            # 夏普比率计算
             returns = trades['balance'].pct_change().dropna()
+            if len(returns) < 2:
+                print("⚠️ 收益数据不足")
+                return
+                
             sharpe = returns.mean() / returns.std() * np.sqrt(365*24)
-            
-            # 最大回撤
+
+            # 最大回撤计算
             equity = trades['balance'].values
-            peak = equity[0]
             max_dd = 0
+            peak = equity[0]
             for value in equity:
                 if value > peak:
                     peak = value
-                dd = (peak - value) / peak
+                dd = (peak - value)/peak
                 max_dd = max(max_dd, dd)
 
             print("\n=== 策略表现报告 ===")
-            print(f"累计收益: {equity[-1]/equity[0]-1:.2%}")
+            print(f"有效交易对: {len(valid_pairs)}")
             print(f"胜率: {win_rate:.2%}")
             print(f"夏普比率: {sharpe:.2f}")
             print(f"最大回撤: {max_dd:.2%}")
-            print(f"总交易次数: {len(trades)//2}")
-            
+
         except Exception as e:
-            print(f"性能分析失败: {str(e)}")
+            print(f"性能分析异常: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
     def run_strategy(self):
         """策略主循环"""
@@ -285,12 +357,18 @@ class EnhancedSuperTrend(AdaptiveSuperTrend):
                 
                 # 趋势变化检测
                 if self.current_trend != direction:
-                    action = '买入' if direction == 1 else '卖出'
-                    print(f"\n🔄 趋势变化检测 ({action})")
                     print(f"当前价格: {df['close'].iloc[-1]:.2f}")
                     print(f"ATR值: {current_atr:.2f} ({['低','中','高'][cluster]}波动)")
-                    self.execute_trade('buy' if direction == 1 else 'sell')
-                    self.current_trend = direction
+                    signal = '趋势转多' if direction == 1 else '趋势转空'
+                    print(f"\n🔄 趋势变化检测 ({signal})")
+                    if (direction == 1 and df['close'].iloc[-1] > df['close'].iloc[-2]) or \
+                        (direction == -1 and df['close'].iloc[-1] < df['close'].iloc[-2]):
+                        action = '买入' if direction == 1 else '卖出'
+                        print(f"\n🔄 执行策略动作 ({action})")
+                        self.execute_trade('buy' if direction == 1 else 'sell')
+                        self.current_trend = direction
+
+
                 
                 # 每小时检查风险
                 self.check_risk_limits()
