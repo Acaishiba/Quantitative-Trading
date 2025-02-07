@@ -17,7 +17,7 @@ exchange = ccxt.binance({
 exchange.load_markets()
 
 # ========== 策略参数 ==========
-SYMBOL = 'SUI/USDT'
+SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
 
 # 核心参数
@@ -28,11 +28,15 @@ CLUSTERS = 3  # 高/中/低波动
 
 # 风控参数
 RISK_PARAMS = {
-    'stop_loss_pct': 0.05,
-    'take_profit_pct': 1.0,
-    'max_drawdown': 0.15,
-    'position_risk_pct': 0.02
+    'stop_loss_pct': 0.03,    # 止损3%
+    'take_profit_pct': 0.10,   # 固定止盈10%（备用）
+    'max_drawdown': 0.15,     # 最大回撤15%
+    'position_risk_pct': 0.02 # 每次仓位风险2%
 }
+
+# 新增参数
+TRAILING_STOP_PCT = 0.035    # 2% 的追踪止损比例
+PULLBACK_THRESHOLD = 0.01    # 1% 的回调幅度作为入场信号
 
 # ========== 核心策略基类 ==========
 class AdaptiveSuperTrend:
@@ -63,7 +67,7 @@ class AdaptiveSuperTrend:
 
     def train_clusters(self, atr_series):
         """改进的聚类初始化方法"""
-        # Pine Script使用分位数初始化
+        # 使用分位数初始化
         high_vol = np.quantile(atr_series, 0.75)
         mid_vol = np.quantile(atr_series, 0.5)
         low_vol = np.quantile(atr_series, 0.25)
@@ -75,57 +79,66 @@ class AdaptiveSuperTrend:
             [high_vol]
         ]), n_init=1)
         
-        self.kmeans.fit(atr_series.values.reshape(-1, 1))      
+        self.kmeans.fit(atr_series.values.reshape(-1, 1))
+        
     def get_cluster_centers(self):
         """获取排序后的聚类中心"""
         return sorted(self.kmeans.cluster_centers_.flatten())
 
     def supertrend(self, df, atr_value, factor):
-        """精确复刻Pine Script逻辑的SuperTrend"""
+        """
+        根据传入数据计算SuperTrend指标，返回最后一根K线的SuperTrend值和方向（1：多头，-1：空头）。
+        逻辑与Pine Script代码类似。
+        """
         hl2 = (df['high'] + df['low']) / 2
         upper = hl2 + factor * atr_value
         lower = hl2 - factor * atr_value
+
+        # 初始化数组
+        n = len(df)
+        upper_bands = [np.nan] * n
+        lower_bands = [np.nan] * n
+        directions = [1] * n
+        supertrend = [np.nan] * n
+
+        # 设置初始值：以第一个K线的计算结果为初始值
+        upper_bands[0] = upper.iloc[0]
+        lower_bands[0] = lower.iloc[0]
+        # 初始方向可根据需求设定，此处假设初始为多头，故SuperTrend取下轨
+        supertrend[0] = lower_bands[0]
         
-        # 初始化轨道数组
-        upper_bands = [np.nan] * len(df)
-        lower_bands = [np.nan] * len(df)
-        directions = [1] * len(df)  # 1=多头，-1=空头
-        supertrend = [np.nan] * len(df)
-        
-        for i in range(1, len(df)):
-            # 继承前值
+        for i in range(1, n):
             prev_upper = upper_bands[i-1]
             prev_lower = lower_bands[i-1]
             prev_close = df['close'].iloc[i-1]
             
-            # 动态调整上下轨
-            # 下轨逻辑
+            # 下轨逻辑：如果当前计算的下轨上移或前一根收盘低于前一根下轨，则更新下轨
             if lower.iloc[i] > prev_lower or prev_close < prev_lower:
                 current_lower = lower.iloc[i]
             else:
                 current_lower = prev_lower
-                
-            # 上轨逻辑    
+                    
+            # 上轨逻辑：如果当前计算的上轨下移或前一根收盘高于前一根上轨，则更新上轨
             if upper.iloc[i] < prev_upper or prev_close > prev_upper:
                 current_upper = upper.iloc[i]
             else:
                 current_upper = prev_upper
-                
-            # 更新轨道值
+                    
             upper_bands[i] = current_upper
             lower_bands[i] = current_lower
-            
-            # 方向判断逻辑
+            print(f"Current Upper={current_upper:.2f}, Lower={current_lower:.2f}, Close={df['close'].iloc[i]}")
+                
+            # 判断方向
             if np.isnan(supertrend[i-1]):
                 directions[i] = -1
             elif supertrend[i-1] == prev_upper:
                 directions[i] = 1 if df['close'].iloc[i] > current_upper else -1
             else:
                 directions[i] = -1 if df['close'].iloc[i] < current_lower else 1
-                
-            # 确定当前SuperTrend值
+                    
+            # 更新SuperTrend值
             supertrend[i] = current_lower if directions[i] == 1 else current_upper
-        
+            
         return supertrend[-1], directions[-1]
 
 # ========== 增强策略子类 ==========
@@ -135,6 +148,7 @@ class EnhancedSuperTrend(AdaptiveSuperTrend):
         self.entry_price = None
         self.stop_loss_price = None
         self.take_profit_price = None
+        self.max_price_since_entry = None  # 新增：记录持仓后的最高价格
         self.equity_curve = []
         self.max_equity = 0
         
@@ -180,7 +194,7 @@ class EnhancedSuperTrend(AdaptiveSuperTrend):
         if drawdown > RISK_PARAMS['max_drawdown']:
             print(f"⚠️ 最大回撤触发：{drawdown*100:.1f}% > {RISK_PARAMS['max_drawdown']*100}%")
             if self.position == 1:
-                self.sell(reason="Max Drawdown")
+                self.execute_trade('sell', reason="Max Drawdown")
             return False
         return True
 
@@ -192,12 +206,12 @@ class EnhancedSuperTrend(AdaptiveSuperTrend):
         coin_balance = balance[SYMBOL.split('/')[0]]['free'] * ticker['last']
         return usdt_balance + coin_balance
 
-    def execute_trade(self, side):
+    def execute_trade(self, side, reason=None):
         """执行交易操作"""
         try:
             current_price = exchange.fetch_ticker(SYMBOL)['last']
-            print(side)
-            
+            if reason:
+                print(f"交易原因: {reason}")
             if side == 'buy':
                 atr = self.data['ATR'].iloc[-1]
                 position_size = self.calculate_position_size(atr)
@@ -205,30 +219,37 @@ class EnhancedSuperTrend(AdaptiveSuperTrend):
                 exchange.create_order(SYMBOL, 'market', 'buy', position_size)
                 self.position = 1
                 self.entry_price = current_price
+                self.max_price_since_entry = current_price  # 初始化最高价格为入场价
                 self.stop_loss_price = current_price * (1 - RISK_PARAMS['stop_loss_pct'])
                 self.take_profit_price = current_price * (1 + RISK_PARAMS['take_profit_pct'])
                 self.record_trade('buy', current_price, position_size)
                 
             elif side == 'sell':
                 coin_balance = exchange.fetch_balance()[SYMBOL.split('/')[0]]['free']
+                if coin_balance <= 0:
+                    print("无可卖出的仓位")
+                    return
                 print(f"📉 卖出信号 | 价格: {current_price:.2f}")
                 exchange.create_order(SYMBOL, 'market', 'sell', coin_balance)
                 self.position = 0
                 self.entry_price = None
+                self.max_price_since_entry = None
                 self.record_trade('sell', current_price, coin_balance)
                 
         except Exception as e:
             print(f"❌ 交易失败: {str(e)}")
 
     def check_risk_limits(self):
-        """风险规则检查"""
+        """风险规则检查：包括止损、止盈和追踪止损"""
         if self.position == 1:
             current_price = exchange.fetch_ticker(SYMBOL)['last']
+            # 追踪止损：若当前价格下破追踪止损价则平仓
             if current_price <= self.stop_loss_price:
-                self.execute_trade('sell')
-                print("🔴 止损触发")
+                self.execute_trade('sell', reason="Trailing Stop Triggered")
+                print("🔴 追踪止损触发")
+            # 固定止盈检查（如有需要可同时保留）
             elif current_price >= self.take_profit_price:
-                self.execute_trade('sell')
+                self.execute_trade('sell', reason="Take Profit Triggered")
                 print("🟢 止盈触发")
 
     def record_trade(self, trade_type, price, quantity):
@@ -286,7 +307,7 @@ class EnhancedSuperTrend(AdaptiveSuperTrend):
             for buy, sell in valid_pairs:
                 if trades.iloc[sell]['balance'] > trades.iloc[buy]['balance']:
                     winning += 1
-            win_rate = winning / len(valid_pairs) if len(valid_pairs) >0 else 0
+            win_rate = winning / len(valid_pairs) if len(valid_pairs) > 0 else 0
 
             # 夏普比率计算
             returns = trades['balance'].pct_change().dropna()
@@ -303,7 +324,7 @@ class EnhancedSuperTrend(AdaptiveSuperTrend):
             for value in equity:
                 if value > peak:
                     peak = value
-                dd = (peak - value)/peak
+                dd = (peak - value) / peak
                 max_dd = max(max_dd, dd)
 
             print("\n=== 策略表现报告 ===")
@@ -318,17 +339,17 @@ class EnhancedSuperTrend(AdaptiveSuperTrend):
             traceback.print_exc()
 
     def run_strategy(self):
-        """策略主循环"""
+        """策略主循环（改进版：每5分钟检查一次）"""
         print("🚀 启动自适应SuperTrend策略")
         last_training = None
         
         while True:
             try:
-                # 获取数据
+                # 获取数据（基于1小时K线数据）
                 df = self.fetch_data(limit=TRAINING_WINDOW+ATR_PERIOD)
                 if len(df) < TRAINING_WINDOW:
                     print("⏳ 等待更多数据...")
-                    sleep(60)
+                    sleep(300)
                     continue
                 
                 # 计算ATR
@@ -347,38 +368,56 @@ class EnhancedSuperTrend(AdaptiveSuperTrend):
                           f"高波动: {centers[2]:.2f}")
                     last_training = current_hour
                 
-                # 选择当前波动率等级
+                # 根据当前ATR选择波动率等级
                 current_atr = atr_series.iloc[-1]
                 cluster = self.kmeans.predict([[current_atr]])[0]
+                centers = self.get_cluster_centers()
                 selected_atr = centers[cluster]
                 
-                # 生成SuperTrend信号
+                # 使用最新ATR_PERIOD的K线生成SuperTrend信号
                 st_value, direction = self.supertrend(df.iloc[-ATR_PERIOD:], selected_atr, SUPERTREND_FACTOR)
                 
-                # 趋势变化检测
+                # 当趋势发生变化时，更新当前趋势标识
                 if self.current_trend != direction:
-                    print(f"当前价格: {df['close'].iloc[-1]:.2f}")
-                    print(f"ATR值: {current_atr:.2f} ({['低','中','高'][cluster]}波动)")
-                    signal = '趋势转多' if direction == 1 else '趋势转空'
-                    print(f"\n🔄 趋势变化检测 ({signal})")
-                    if (direction == 1 and df['close'].iloc[-1] > df['close'].iloc[-2]) or \
-                        (direction == -1 and df['close'].iloc[-1] < df['close'].iloc[-2]):
-                        action = '买入' if direction == 1 else '卖出'
-                        print(f"\n🔄 执行策略动作 ({action})")
-                        self.execute_trade('buy' if direction == 1 else 'sell')
-                        self.current_trend = direction
-
-
+                    print(f"趋势变化检测: 新趋势 {'多头' if direction==1 else '空头'}")
+                    self.current_trend = direction
                 
-                # 每小时检查风险
+                # ★【新增】回调买入逻辑：在多头趋势中，若当前没有持仓且发现价格出现短暂回调，则买入
+                if self.current_trend == 1 and self.position == 0:
+                    ticker = exchange.fetch_ticker(SYMBOL)
+                    current_price = ticker['last']
+                    print(f"当前价格: {current_price:.2f}")
+                    # 取最近3根K线收盘价作为参考
+                    recent_closes = df['close'].iloc[-3:]
+                    recent_peak = recent_closes.max()
+                    if current_price < recent_peak * (1 - PULLBACK_THRESHOLD):
+                        print(f"检测到上行趋势中的回调: 当前价格 {current_price:.2f} 距离最近高点 {recent_peak:.2f} 下跌超过 {PULLBACK_THRESHOLD*100:.1f}%")
+                        self.execute_trade('buy')
+                
+                # ★【新增】趋势转空时，若有持仓，则立即卖出
+                if self.current_trend == -1 and self.position == 1:
+                    print("检测到空头趋势，准备平多仓")
+                    self.execute_trade('sell')
+                
+                # ★【新增】持仓时更新追踪止损：
+                if self.position == 1:
+                    ticker = exchange.fetch_ticker(SYMBOL)
+                    current_price = ticker['last']
+                    if self.max_price_since_entry is None or current_price > self.max_price_since_entry:
+                        self.max_price_since_entry = current_price
+                        # 更新追踪止损价：以最高价下跌TRAILING_STOP_PCT比例作为止损价
+                        self.stop_loss_price = self.max_price_since_entry * (1 - TRAILING_STOP_PCT)
+                        print(f"更新追踪止损价: {self.stop_loss_price:.2f} (最高价 {self.max_price_since_entry:.2f})")
+                
+                # 每5分钟检查风险限制（包括追踪止损和固定止盈）
                 self.check_risk_limits()
                 self.update_drawdown()
                 
-                # 每小时保存日志
+                # 每小时整点分析一次策略表现
                 if datetime.now().minute == 0:
                     self.analyze_performance()
                 
-                sleep(3600)  # 每小时运行
+                sleep(300)  # 每5分钟运行一次
                 
             except Exception as e:
                 print(f"策略异常: {str(e)}")
